@@ -1,76 +1,94 @@
-"""
-Run PalmTree pre-trained model on Apple Silicon (CPU mode).
+"""Entry point for PalmTree on Apple Silicon / modern PyTorch.
 
-Handles:
-- bert_pytorch -> palmtree module redirect (pickle compat)
-- CUDA -> CPU device mapping
-- Deprecated scipy imports
+This script has two responsibilities:
+
+1. **Pickle compatibility shim.** The released pre-trained model was pickled
+   against a package named `bert_pytorch`, but the source in this repo lives
+   under `palmtree`. Before any `torch.load` runs, we register alias entries
+   in `sys.modules` so the pickle deserializes against the renamed package.
+
+2. **Experiment dispatcher.** A CLI that loads the model once and runs either
+   the original demo or one of the experiments in `experiments/` (a set of
+   hands-on probes that characterize what PalmTree's embeddings capture and
+   where they break down — see thesis-vault note `palmtree-experiments.md`).
 
 Usage:
     source .venv/bin/activate
-    python run_palmtree.py
+    python run_palmtree.py                 # list available experiments
+    python run_palmtree.py demo            # basic-block encoding demo
+    python run_palmtree.py a1              # A1 - semantic clustering
+    python run_palmtree.py all             # run every experiment in order
+    python run_palmtree.py --help
 """
 
 import sys
 import os
 
-# --- Module shim: pickle expects 'bert_pytorch.*', source lives at 'palmtree.*' ---
-# Add src/ to path so 'palmtree' package is importable
+# --- Pickle module shim (MUST run before any torch.load) -------------------
+# The pickle inside pre-trained_model/palmtree/transformer.ep19 references
+# classes under `bert_pytorch.*`. Redirect those names to the `palmtree.*`
+# package that actually ships in src/.
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-# Add pre-trained_model/ so vocab.py and config.py are importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "pre-trained_model"))
 
-import palmtree as _palmtree_pkg
+import palmtree as _palmtree_pkg  # noqa: E402
 sys.modules["bert_pytorch"] = _palmtree_pkg
 
-# Register all submodules that the pickle references
-import palmtree.dataset.vocab
-import palmtree.model.bert
-import palmtree.model.transformer
-import palmtree.model.attention.single
-import palmtree.model.attention.multi_head
-import palmtree.model.embedding.bert
-import palmtree.model.embedding.position
-import palmtree.model.embedding.segment
-import palmtree.model.embedding.token
-import palmtree.model.utils.feed_forward
-import palmtree.model.utils.gelu
-import palmtree.model.utils.layer_norm
-import palmtree.model.utils.sublayer
+# Eagerly import every submodule the pickle may reference.
+import palmtree.dataset.vocab            # noqa: E402,F401
+import palmtree.model.bert               # noqa: E402,F401
+import palmtree.model.transformer        # noqa: E402,F401
+import palmtree.model.attention.single   # noqa: E402,F401
+import palmtree.model.attention.multi_head  # noqa: E402,F401
+import palmtree.model.embedding.bert     # noqa: E402,F401
+import palmtree.model.embedding.position # noqa: E402,F401
+import palmtree.model.embedding.segment  # noqa: E402,F401
+import palmtree.model.embedding.token    # noqa: E402,F401
+import palmtree.model.utils.feed_forward # noqa: E402,F401
+import palmtree.model.utils.gelu         # noqa: E402,F401
+import palmtree.model.utils.layer_norm   # noqa: E402,F401
+import palmtree.model.utils.sublayer     # noqa: E402,F401
+import palmtree                          # noqa: E402
 
-sys.modules["bert_pytorch.dataset"] = palmtree.dataset
-sys.modules["bert_pytorch.dataset.vocab"] = palmtree.dataset.vocab
-sys.modules["bert_pytorch.model"] = palmtree.model
-sys.modules["bert_pytorch.model.bert"] = palmtree.model.bert
-sys.modules["bert_pytorch.model.transformer"] = palmtree.model.transformer
-sys.modules["bert_pytorch.model.attention"] = palmtree.model.attention
-sys.modules["bert_pytorch.model.attention.single"] = palmtree.model.attention.single
-sys.modules["bert_pytorch.model.attention.multi_head"] = palmtree.model.attention.multi_head
-sys.modules["bert_pytorch.model.embedding"] = palmtree.model.embedding
-sys.modules["bert_pytorch.model.embedding.bert"] = palmtree.model.embedding.bert
-sys.modules["bert_pytorch.model.embedding.position"] = palmtree.model.embedding.position
-sys.modules["bert_pytorch.model.embedding.segment"] = palmtree.model.embedding.segment
-sys.modules["bert_pytorch.model.embedding.token"] = palmtree.model.embedding.token
-sys.modules["bert_pytorch.model.utils"] = palmtree.model.utils
-sys.modules["bert_pytorch.model.utils.feed_forward"] = palmtree.model.utils.feed_forward
-sys.modules["bert_pytorch.model.utils.gelu"] = palmtree.model.utils.gelu
-sys.modules["bert_pytorch.model.utils.layer_norm"] = palmtree.model.utils.layer_norm
-sys.modules["bert_pytorch.model.utils.sublayer"] = palmtree.model.utils.sublayer
+_ALIASES = {
+    "bert_pytorch.dataset": palmtree.dataset,
+    "bert_pytorch.dataset.vocab": palmtree.dataset.vocab,
+    "bert_pytorch.model": palmtree.model,
+    "bert_pytorch.model.bert": palmtree.model.bert,
+    "bert_pytorch.model.transformer": palmtree.model.transformer,
+    "bert_pytorch.model.attention": palmtree.model.attention,
+    "bert_pytorch.model.attention.single": palmtree.model.attention.single,
+    "bert_pytorch.model.attention.multi_head": palmtree.model.attention.multi_head,
+    "bert_pytorch.model.embedding": palmtree.model.embedding,
+    "bert_pytorch.model.embedding.bert": palmtree.model.embedding.bert,
+    "bert_pytorch.model.embedding.position": palmtree.model.embedding.position,
+    "bert_pytorch.model.embedding.segment": palmtree.model.embedding.segment,
+    "bert_pytorch.model.embedding.token": palmtree.model.embedding.token,
+    "bert_pytorch.model.utils": palmtree.model.utils,
+    "bert_pytorch.model.utils.feed_forward": palmtree.model.utils.feed_forward,
+    "bert_pytorch.model.utils.gelu": palmtree.model.utils.gelu,
+    "bert_pytorch.model.utils.layer_norm": palmtree.model.utils.layer_norm,
+    "bert_pytorch.model.utils.sublayer": palmtree.model.utils.sublayer,
+}
+sys.modules.update(_ALIASES)
 
-# --- Now load and use the model ---
-import torch
-import numpy as np
-import pickle
+# --- Normal imports (safe now that the shim is installed) ------------------
+import argparse  # noqa: E402
+import pickle    # noqa: E402
+import torch     # noqa: E402
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "pre-trained_model", "palmtree")
 MODEL_PATH = os.path.join(MODEL_DIR, "transformer.ep19")
 VOCAB_PATH = os.path.join(MODEL_DIR, "vocab")
 
-SEQ_LEN = 20  # max tokens per instruction (from training config)
-
 
 def load_model():
-    """Load pre-trained PalmTree model and vocab onto CPU."""
+    """Load the pre-trained PalmTree model and its WordVocab onto CPU.
+
+    Returns (model, vocab). The model is put into eval mode so dropout and
+    other training-only behaviors are disabled.
+    """
     print(f"Loading vocab from {VOCAB_PATH}")
     with open(VOCAB_PATH, "rb") as f:
         vocab = pickle.load(f)
@@ -79,85 +97,53 @@ def load_model():
     print(f"Loading model from {MODEL_PATH}")
     model = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
     model.eval()
-    print(f"  Model loaded (CPU mode)")
+
+    n_layers = len(model.transformer_blocks)
+    hidden = model.hidden
+    print(f"  Model loaded: BERT n_layers={n_layers}, hidden={hidden} (CPU mode)")
     return model, vocab
 
 
-def encode(model, vocab, instructions):
-    """
-    Encode a list of assembly instructions into embeddings.
-
-    Args:
-        model: loaded PalmTree BERT model
-        vocab: loaded WordVocab
-        instructions: list of strings, e.g. ["mov rbp rdi", "call memcpy"]
-                      tokens must be space-separated
-
-    Returns:
-        numpy array of shape (len(instructions), 128)
-    """
-    segment_label = []
-    sequence = []
-    for ins in instructions:
-        tokens = ins.split(" ")
-        # +2 for <sos> and <eos> tokens
-        label = [1] * (len(tokens) + 2)
-        seq = vocab.to_seq(ins)
-        seq = [3] + seq + [2]  # 3=<sos>, 2=<eos>
-
-        # Pad or truncate to SEQ_LEN
-        if len(label) > SEQ_LEN:
-            segment_label.append(label[:SEQ_LEN])
-        else:
-            segment_label.append(label + [0] * (SEQ_LEN - len(label)))
-        if len(seq) > SEQ_LEN:
-            sequence.append(seq[:SEQ_LEN])
-        else:
-            sequence.append(seq + [0] * (SEQ_LEN - len(seq)))
-
-    segment_label = torch.LongTensor(segment_label)
-    sequence = torch.LongTensor(sequence)
-
-    with torch.no_grad():
-        encoded = model.forward(sequence, segment_label)
-        # Mean-pool across token dimension -> one vector per instruction
-        result = torch.mean(encoded, dim=1)
-
-    return result.numpy()
-
-
 def main():
+    parser = argparse.ArgumentParser(
+        description="Run PalmTree experiments.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "experiment",
+        nargs="?",
+        default=None,
+        help="Experiment name. Omit to list available experiments.",
+    )
+    args = parser.parse_args()
+
+    # Lazy import so that `--help` does not trigger model loading.
+    from experiments import EXPERIMENTS
+
+    if args.experiment is None:
+        print("Available experiments:\n")
+        for name, (desc, _) in EXPERIMENTS.items():
+            print(f"  {name:6s}  {desc}")
+        print("\n  all     Run every experiment in order")
+        print(f"\nRun with:  python {os.path.basename(__file__)} <name>")
+        return
+
+    if args.experiment not in EXPERIMENTS and args.experiment != "all":
+        parser.error(
+            f"unknown experiment '{args.experiment}'. "
+            f"Known: {', '.join(EXPERIMENTS)} or 'all'."
+        )
+
     model, vocab = load_model()
 
-    # Example: x86 assembly instructions (space-separated tokens)
-    instructions = [
-        "mov rbp rdi",
-        "mov ebx 0x1",
-        "mov rdx rbx",
-        "call memcpy",
-        "mov [ rcx + rbx ] 0x0",
-        "mov rcx rax",
-        "mov [ rax ] 0x2e",
-    ]
+    if args.experiment == "all":
+        for name, (desc, fn) in EXPERIMENTS.items():
+            print(f"\n\n{'#' * 70}\n# {name}: {desc}\n{'#' * 70}")
+            fn(model, vocab)
+        return
 
-    print(f"\nEncoding {len(instructions)} instructions...")
-    embeddings = encode(model, vocab, instructions)
-
-    print(f"Output shape: {embeddings.shape}")
-    print(f"  -> {len(instructions)} instructions x {embeddings.shape[1]}-dim embeddings\n")
-
-    # Show per-instruction embedding norms (sanity check)
-    for ins, emb in zip(instructions, embeddings):
-        norm = np.linalg.norm(emb)
-        print(f"  {ins:30s}  ||emb|| = {norm:.4f}")
-
-    # Cosine similarity between first two instructions (both 'mov' variants)
-    from numpy.linalg import norm
-    cos_sim = np.dot(embeddings[0], embeddings[1]) / (norm(embeddings[0]) * norm(embeddings[1]))
-    print(f"\nCosine similarity('mov rbp rdi', 'mov ebx 0x1') = {cos_sim:.4f}")
-
-    cos_sim2 = np.dot(embeddings[0], embeddings[3]) / (norm(embeddings[0]) * norm(embeddings[3]))
-    print(f"Cosine similarity('mov rbp rdi', 'call memcpy')  = {cos_sim2:.4f}")
+    _, fn = EXPERIMENTS[args.experiment]
+    fn(model, vocab)
 
 
 if __name__ == "__main__":
