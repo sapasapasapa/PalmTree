@@ -21,15 +21,36 @@ data movement, arithmetic, comparison, and control flow. Then:
 No t-SNE/UMAP is drawn (sklearn + matplotlib aren't installed in the pinned
 venv) - instead we report the numbers that those plots would visually convey.
 
-What the result reveals
------------------------
-- If intra >> inter and purity is high, PalmTree has learned a genuinely
-  semantic space where instructions group by function.
-- If intra ~ inter or purity is near random (1/n_families), the space is
-  mostly driven by surface tokens and not semantic category.
-- If `lea rax [rbx + rcx*4]` classifies as arithmetic rather than data
-  movement, the model has inferred that `lea` is effectively an arithmetic
-  instruction - a non-trivial semantic deduction.
+What the result reveals - concrete consequences
+-------------------------------------------------
+- **Large positive gap (intra >> inter) + high purity**: PalmTree has learned
+  a genuinely semantic space. Downstream similarity tasks (function cloning,
+  malware family classification) will have strong structural signal to
+  exploit - a linear classifier on top of the embeddings should work out of
+  the box.
+- **Gap near zero or negative purity**: the space is driven mainly by surface
+  token co-occurrence, not semantic category. Practical consequence: any
+  downstream task that assumes "instructions doing similar things have
+  similar embeddings" will need fine-tuning on labeled pairs. Frozen-model
+  transfer will underperform.
+- **data_movement has low/negative intra-gap (observed)**: `mov` variants are
+  genuinely far apart in the space because operand patterns (reg-reg vs
+  memory-load vs memory-store) dominate the embedding. This is a *feature*
+  for operand-aware downstream tasks (stack-frame analysis, call-convention
+  inference) but a *bug* for coarse opcode-family classification. If your
+  downstream task treats all movs as interchangeable, you will want to
+  pre-cluster or aggregate them yourself.
+- **`lea rax [rbx + rcx*4]` classified as arithmetic**: the model has
+  inferred a non-trivial semantic property - that `lea` is an ALU op, not
+  data movement. This is exactly the kind of deduction you want for reverse
+  engineering: the model learned from behavior patterns in Coreutils that
+  `lea` appears near adds/imuls even though its mnemonic says "load".
+- **Purity 60-70%**: typical "good but not great". Downstream classifiers
+  can reach higher accuracy by pooling multiple instructions (reducing
+  per-sample noise) and/or adding explicit opcode features on top of the
+  embedding.
+- **Purity < 30% (near random)**: something is broken in the pipeline or the
+  model file. Re-check the pickle shim and the vocab load.
 """
 
 from __future__ import annotations
@@ -83,22 +104,39 @@ PROBES = [
 def run(model, vocab):
     c.print_header("A1 - Semantic clustering of instruction families")
 
+    # Flatten the dict-of-lists into parallel arrays: instructions[i] is
+    # labelled by labels[i]. Keeping these aligned lets us reference family
+    # membership by row index into the embedding matrix below.
     all_instructions, all_labels = [], []
     for family, items in FAMILIES.items():
         all_instructions.extend(items)
         all_labels.extend([family] * len(items))
 
+    # emb is (N, 128): one embedding vector per instruction.
     emb = c.encode(model, vocab, all_instructions)
+    # sim is (N, N): cosine similarity between every pair of instructions.
+    # sim[i, j] == sim[j, i], and sim[i, i] == 1.0 (self-similarity).
     sim = c.pairwise_cosine(emb)
 
     # --- intra vs inter family means -------------------------------------
     c.print_subheader("Intra vs inter-family mean cosine similarity")
     family_names = list(FAMILIES.keys())
     for f in family_names:
+        # Row indices of the instructions belonging to this family.
         idxs = [i for i, l in enumerate(all_labels) if l == f]
+        # intra: similarities between DIFFERENT members of the same family.
+        # `i < j` filter avoids counting (i, j) and (j, i) twice, and skips
+        # the self-pair (i, i) which would always be 1.0 and bias the mean.
         intra = [sim[i, j] for i in idxs for j in idxs if i < j]
         others = [i for i, l in enumerate(all_labels) if l != f]
+        # inter: similarities between each member of this family and every
+        # member of every OTHER family. No double-count filter needed because
+        # we iterate one direction only (family -> others).
         inter = [sim[i, j] for i in idxs for j in others]
+        # "gap" is the key diagnostic. Positive gap means the family is more
+        # internally coherent than it is similar to the rest; negative gap
+        # means the family is LESS tight than random cross-family pairs
+        # (observed here for data_movement).
         print(f"  {f:16s}  intra={np.mean(intra):+.3f}  inter={np.mean(inter):+.3f}  "
               f"gap={np.mean(intra) - np.mean(inter):+.3f}")
 
@@ -106,8 +144,13 @@ def run(model, vocab):
     c.print_subheader("1-NN cluster purity (is the nearest neighbor in the same family?)")
     correct = 0
     for i, ins in enumerate(all_instructions):
+        # Work on a copy because we're about to mutate the row.
         row = sim[i].copy()
+        # Set self-similarity to -inf so argmax cannot pick index i. This is
+        # the standard trick for "nearest neighbor excluding self".
         row[i] = -np.inf
+        # np.argmax returns the index of the maximum value. int() casts the
+        # numpy scalar back to a Python int for cleaner printing + indexing.
         nn = int(np.argmax(row))
         hit = all_labels[nn] == all_labels[i]
         correct += hit
@@ -115,15 +158,24 @@ def run(model, vocab):
         print(f"  [{flag}] {ins:35s} -> {all_instructions[nn]:35s} "
               f"({all_labels[nn]}, sim={row[nn]:+.3f})")
     total = len(all_instructions)
+    # Compare against the random baseline (1/num_families) so the reader can
+    # gauge "is 67% actually good?" - 67% against a 25% baseline is a ~2.7x
+    # lift over random, not a hard-pass on its own.
     print(f"\n  Purity: {correct}/{total} = {correct / total:.2%}  "
           f"(random baseline = 1/{len(family_names)} = {1 / len(family_names):.2%})")
 
     # --- probe classification --------------------------------------------
     c.print_subheader("Probe classification (top-3 nearest across all families)")
+    # Encode each probe once. probe_emb is (n_probes, 128).
     probe_emb = c.encode(model, vocab, [p[0] for p in PROBES])
     for (probe, description), p_vec in zip(PROBES, probe_emb):
         print(f"\n  probe: {probe}  ({description})")
+        # top_k_nearest ranks all instructions by cosine sim to the probe.
+        # We pack (instruction, family) tuples as labels so we can recover
+        # family membership for each neighbor.
         neighbors = c.top_k_nearest(p_vec, emb, list(zip(all_instructions, all_labels)), k=3)
+        # Counter tallies family votes across the top-3 neighbors. Ties are
+        # broken by Counter.most_common returning items in insertion order.
         votes = Counter()
         for (ins, fam), s in neighbors:
             print(f"      sim={s:+.3f}  [{fam:14s}]  {ins}")

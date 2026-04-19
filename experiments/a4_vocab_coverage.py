@@ -23,18 +23,44 @@ grouped by expected coverage tier:
 For each tier we tokenize every instruction, look up each token in
 vocab.stoi, and count how many map to unk_index (1).
 
-What the result reveals
------------------------
-- A high OOV rate on CORE would invalidate the model's basic claim to
-  represent x86 semantics. (Expected: ~0% OOV.)
-- High OOV rates on SIMD and SYSCALL_PRIV tell you which production binary
-  classes PalmTree cannot represent meaningfully.
-- LIBC_CALLEES being almost entirely OOV demonstrates the practical
-  limitation of treating callee symbols as raw tokens without a
-  symbol-table-driven normalization pass.
-- RAW_LITERALS being OOV is actually BY DESIGN - PalmTree's intended
-  pre-processing maps large hex to `address`. If you skip that step, every
-  literal is a fresh unk.
+What the result reveals - concrete consequences
+-------------------------------------------------
+- **CORE tier ~0% OOV (expected)**: basic userspace x86 is fully covered.
+  Any nonzero CORE OOV means the vocab file is wrong or truncated - stop
+  and re-verify the pickle load.
+- **SIMD/AVX tier 30-60% OOV (observed ~32%)**: every `ymm*` and many
+  `vpXXX` / `vmovXXX` mnemonics are missing. Practical consequence:
+  performance-critical code (crypto, media, ML kernels, modern `memcpy`
+  that goes through AVX) cannot be meaningfully represented. A
+  function-level embedding of an AVX-heavy binary will be dominated by
+  `<unk>` tokens and collapse to an uninformative vector. If your thesis
+  evaluates PalmTree on OpenSSL or a video codec, your numbers will look
+  worse than PalmTree's real capability simply because of vocabulary
+  mismatch - not a model-quality issue.
+- **SYSCALL_PRIV tier ~50%+ OOV (observed ~56%)**: kernel code, bootloaders,
+  hypervisors, and anything using privileged instructions is out of scope.
+  Consequence: PalmTree is NOT the right embedding for a kernel-fuzzing or
+  syscall-clustering task without vocab extension or retraining.
+- **LIBC_CALLEES ~50% OOV (every function name misses)**: the only token
+  that distinguishes `call memcpy` from `call malloc` is the callee - and
+  it's unk. Consequence (also surfaced in A2): your pipeline must rename
+  libc targets to `symbol` (or richer normalization) BEFORE encoding or
+  you lose all library-call distinction.
+- **RAW_LITERALS ~30% OOV (by design)**: large hex constants collapse to
+  `<unk>` because PalmTree expects a preprocessor (Binary Ninja in the
+  paper) to have already mapped them to `address` / `string`. If you're
+  feeding raw objdump output, you're skipping this step and silently
+  degrading the embedding. The fix is a ~10-line normalization pass that
+  maps constants wider than 6 hex digits (but narrower than 15) to
+  `address` when absent from the symbol table, `symbol` when present.
+- **Top OOV token list (printed at the end)**: tells you concretely WHICH
+  tokens are missing. If a single OOV token dominates (e.g. `ymm0`
+  appearing 5 times), you may be able to plug the gap with a targeted
+  vocab extension rather than a full retrain. If the list is scattered
+  across hundreds of different tokens, retrain or swap models.
+- **Total OOV rate**: one number to report in a thesis chapter when arguing
+  "PalmTree's vocabulary is shaped like Coreutils". A rate >20% on a
+  non-Coreutils corpus is a defensible concrete claim.
 """
 
 from __future__ import annotations
@@ -113,11 +139,15 @@ TIERS = {
 
 def run(model, vocab):
     c.print_header("A4 - Vocabulary coverage across instruction tiers")
+    # vocab.stoi is the string-to-index dict. Its length == vocab size.
+    # vocab.unk_index (typically 1) is the fallback for unknown tokens.
     print(f"Vocab size: {len(vocab.stoi)} tokens (unk_index={vocab.unk_index})")
 
     totals_tokens = 0
     totals_oov = 0
     tier_summary = []
+    # Counter accumulates how often each OOV token appears across ALL tiers.
+    # Useful for the "top offenders" summary at the end.
     all_oov_tokens = Counter()
 
     for tier, instructions in TIERS.items():
@@ -125,17 +155,26 @@ def run(model, vocab):
         tier_tok = 0
         tier_oov = 0
         for ins in instructions:
+            # c.oov_tokens splits on whitespace and looks up each token in
+            # vocab.stoi; returns list[(token, is_oov_bool)].
             toks = c.oov_tokens(vocab, ins)
+            # Pull out just the tokens that hit <unk>.
             oov = [t for t, is_oov in toks if is_oov]
             tier_tok += len(toks)
             tier_oov += len(oov)
             totals_tokens += len(toks)
             totals_oov += len(oov)
+            # Counter.update(iterable) increments counts for every element.
+            # For an OOV token that appears twice in this instruction, the
+            # counter gets +2 for it - which is what we want for "top
+            # offenders" ranking.
             all_oov_tokens.update(oov)
             if oov:
                 print(f"    [{len(oov)}/{len(toks)} OOV: {', '.join(oov)}]  {ins}")
             else:
                 print(f"    [0/{len(toks)} OOV]                          {ins}")
+        # Guard against zero-division if a tier is empty (shouldn't happen,
+        # but keeps the function total-safe if someone edits TIERS later).
         rate = tier_oov / tier_tok if tier_tok else 0.0
         tier_summary.append((tier, tier_tok, tier_oov, rate))
         print(f"  tier OOV rate: {tier_oov}/{tier_tok} = {rate:.1%}")

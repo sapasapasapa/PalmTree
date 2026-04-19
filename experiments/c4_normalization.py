@@ -27,17 +27,47 @@ And for calls:
 
 Report pairwise cosine similarities.
 
-What the result reveals
------------------------
-- If normalized `address` / `symbol` embeddings are far from raw hex
-  variants, normalization is a hard prerequisite and the model is brittle
-  to disassembler choice.
-- If `call memcpy` is very different from `call symbol`, the model has
-  learned specific library function semantics (important for reverse
-  engineering use cases where symbols are often available).
-- If `0x8` (small offset, kept as-is by PalmTree's rule) is much closer to
-  `address` than to raw large hex, the model treats small constants as
-  essentially-normalized already.
+What the result reveals - concrete consequences
+-------------------------------------------------
+- **Raw hex vs `address` far apart (cosine < 0.8)**: normalization is a
+  hard prerequisite. A pipeline that forgets to rewrite `0xdeadbeef` to
+  `address` will produce materially different embeddings than one that
+  does. Concrete consequence for a deployment: the preprocessing pipeline
+  is part of the model's de facto interface - disassembler choice, symbol
+  resolution, and constant-rewriting rules ALL affect the output and must
+  be pinned alongside the model file. This makes PalmTree effectively
+  tightly coupled to its Binary Ninja / objdump+postprocess toolchain.
+- **`address` and `symbol` close but distinct (cosine ~0.7)**: PalmTree
+  distinguishes "known function symbol" from "raw unknown address".
+  Consequence: your preprocessor's rule for WHEN to emit `symbol` vs
+  `address` matters. For a target found in the symbol table, emit
+  `symbol`; for an unresolved address, emit `address`. Mixing them up
+  (e.g. using `symbol` for every call target even when the name is
+  missing) changes the embedding.
+- **`call memcpy` cosine 1.000 with `call malloc` and `call printf`**: all
+  three libc names are OOV and collapse to `<unk>` - no library-function
+  distinction survives. Consequence: any downstream task that wants
+  "detect all malloc calls" or "find memcpy-heavy functions" CANNOT rely
+  on the shipped embedding alone. Either (a) fine-tune with added
+  vocabulary, or (b) feed PalmTree a pre-normalized stream where libc
+  targets are replaced by `symbol` (losing the specific-function
+  distinction but at least not collapsing to unk).
+- **Small constant (0x8) close to `address` rather than to raw 0xdeadbeef**:
+  the model has learned that small constants (un-normalized by PalmTree's
+  rule) are conceptually closer to addresses than to random unk tokens.
+  This is the BERT weights paying off - the model has formed a prior that
+  small hex constants tend to co-occur with memory/pointer contexts.
+- **Call-variant spread wide (min cosine < 0.5)**: you CAN distinguish
+  register-indirect calls from memory-indirect calls from symbol calls,
+  which is useful for dispatch-pattern detection. Narrow spread would
+  mean PalmTree treats most `call` variants as the same thing, requiring
+  extra features to recover dispatch semantics.
+
+Bottom line for deployment: PalmTree is normalization-sensitive. Publish
+(or pin) the exact preprocessor alongside any embedding database; a
+function embedded with one normalization will not retrieve the same
+function embedded with another. For a thesis, this is a concrete example
+of how "the model" is actually "the model + the preprocessor".
 """
 
 from __future__ import annotations
@@ -63,11 +93,15 @@ def run(model, vocab):
     c.print_oov_report(vocab, mem_variants, "memory operand variants")
     print("  (raw large hex constants are OOV, collapsing to <unk> - this IS the")
     print("   normalization behavior PalmTree expects you to do up-front.)")
+    # Encode all six variants in one batch, then build the 6x6 cosine matrix.
     emb = c.encode(model, vocab, mem_variants)
     sim = c.pairwise_cosine(emb)
     c.print_similarity_matrix(mem_variants, sim, max_label_width=36)
 
-    # Pairs of interest
+    # Small closure to look up a specific pair's similarity by instruction
+    # string. list.index() returns the position of the first matching item.
+    # We use this instead of hardcoded indices so adding/reordering entries
+    # in mem_variants doesn't break the downstream prints.
     def pair(name_a, name_b):
         ia, ib = mem_variants.index(name_a), mem_variants.index(name_b)
         return sim[ia, ib]
@@ -105,7 +139,10 @@ def run(model, vocab):
     print(f"    memcpy-vs-printf      : {sim[3, 5]:+.3f}")
     print(f"    raw-vs-address        : {sim[0, 1]:+.3f}   (proxy for normalization impact)")
 
-    # Summary
+    # Summary - same upper-triangle extraction as A2/B2/B3:
+    # np.triu_indices_from(sim, k=1) picks the strict upper triangle indices
+    # (i < j), which is exactly the unique pairwise sims (no diagonal,
+    # no duplicates).
     upper = sim[np.triu_indices_from(sim, 1)]
     print(f"\n  Full spread on call variants: min={upper.min():+.3f}  max={upper.max():+.3f}")
     print("  Narrow spread => model relies heavily on normalization tokens; wide")

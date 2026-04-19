@@ -26,13 +26,40 @@ Report pairwise cosine similarities. A fine-grained tokenizer should:
 - Spread `add` variants by immediate magnitude if the model has learned
   that small/medium/large constants behave differently.
 
-What the result reveals
------------------------
-If the model collapses all these variants to nearly the same embedding,
-the fine-grained tokens are decorative - the extra vocabulary wasn't used
-meaningfully during MLM pre-training. If the variants spread out cleanly,
-the punctuation tokens are carrying real structural information and PalmTree
-is genuinely finer-grained than Asm2Vec.
+What the result reveals - concrete consequences
+-------------------------------------------------
+- **rbp-variants cluster tightly (cosine > 0.7) separate from rsp-variants**:
+  PalmTree has learned that stack-frame (rbp-relative) and raw-stack
+  (rsp-relative) memory accesses are different concepts. This is directly
+  useful for prologue/epilogue detection, local-variable reconstruction,
+  and stack-smashing-protector recognition.
+- **Memory-base collapse (all rbp/rsp/[rax] near-identical)**: operand
+  structure is NOT being captured. Any downstream task that relies on
+  distinguishing "local variable access" from "raw pointer deref" will
+  need handcrafted features on top of the embedding.
+- **Monotonic similarity decrease in offset magnitude (0x8, 0x80, 0x800…)**:
+  the model treats offset size as a quantity - consistent with learned
+  numerical semantics. Useful for array-index-vs-struct-field disambigua-
+  tion. Non-monotonic similarity means the model sees each constant as a
+  categorical token with no ordering (the more common outcome).
+- **Scale factors with cosine > 0.9 (all near-equivalent)**: PalmTree does
+  NOT meaningfully distinguish `[rbx + rcx*4]` (32-bit-array index) from
+  `[rbx + rcx*8]` (64-bit-array index). Consequence: data-type inference
+  from assembly using these embeddings alone will lose the scale signal -
+  you'll need a separate scale-aware feature.
+- **Immediate-size spread wide (min < 0.5)**: the model has differentiated
+  representations for small constants, medium constants, and 0xFF-class
+  flag masks. Useful for detecting comparison-against-sentinel patterns.
+- **All immediates near-equal**: consequence is lossy for tasks that care
+  about "add 1" vs "add a giant number" - common in loop-increment vs
+  pointer-arithmetic distinction.
+
+Practical takeaway: PalmTree's fine granularity is partially realized. The
+`[`/`+`/`]` punctuation and register-name tokens carry signal; scale factors
+and large immediates often do not. Downstream pipelines that need those
+distinctions should either (a) add explicit features, (b) fine-tune on
+labeled pairs, or (c) preprocess instructions to normalize what the model
+already collapses (reducing noise in the embedding).
 """
 
 from __future__ import annotations
@@ -43,9 +70,17 @@ from . import _common as c
 
 
 def _cosine_table(labels, emb):
+    """Print a labeled NxN cosine matrix + min/max/spread over unique pairs."""
+    # pairwise_cosine: unit-normalize rows, then matmul -> (N, N) cosines.
     sim = c.pairwise_cosine(emb)
     c.print_similarity_matrix(labels, sim, max_label_width=34)
+    # np.triu_indices_from(sim, 1): indices of the strict upper triangle.
+    # Indexing sim with these yields the unique off-diagonal pairs as a 1-D
+    # array (skipping self-sims which are always 1.0 and redundant duplicates).
     upper = sim[np.triu_indices_from(sim, 1)]
+    # "spread" = max - min is a quick "how much does this set vary?" metric.
+    # Large spread => the model distinguishes variants; near-zero spread =>
+    # the model treats them as essentially the same instruction.
     print(f"  off-diagonal:  min={upper.min():+.3f}  max={upper.max():+.3f}  "
           f"spread={upper.max() - upper.min():.3f}")
 
