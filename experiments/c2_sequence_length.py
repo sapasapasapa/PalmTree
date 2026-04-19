@@ -21,22 +21,31 @@ Procedure
    truncated and the untruncated embeddings - this quantifies how much
    information the truncation throws away.
 
-What the result reveals - concrete consequences
--------------------------------------------------
-- **~0% of a realistic sample exceeds 18 content tokens**: SEQ_LEN=20 is
-  fine for typical Coreutils-like code. You can rely on the shipped
+What the experiment reveals
+---------------------------
+(Purely hypothetical branches. Each bullet is "IF you see X -> it means Y",
+covering possibilities that may or may not materialize in any given run.
+The actual numbers from this run are in "Observed results" below.)
+
+- **IF ~0% of a realistic sample exceeds 18 content tokens**: SEQ_LEN=20
+  is fine for typical Coreutils-like code. You can rely on the shipped
   behavior without worrying about silent truncation.
-- **A handful of complex instructions exceed the cap**: the LEFT-to-right
-  tokenization drops RIGHT-side tokens - which usually means losing
-  destination operands or trailing prefix information. Any downstream
-  task that encodes locked atomics, long AVX512-encoded ops, or nested
-  SIB+displacement+extra-operand patterns will silently drop information.
-  If >5% of your instruction stream exceeds the cap, you need to either
-  (a) raise SEQ_LEN and retrain positional embeddings, or (b) preprocess
-  instructions to collapse them to fewer tokens (merge consecutive
-  addressing tokens into a single compound token).
-- **Embedding of SEQ_LEN=20 vs SEQ_LEN=32 is cosine ~0.90, NOT ~1.00**: two
-  distinct effects are mixed in here:
+- **IF a small fraction (<5%) of complex instructions exceed the cap**:
+  the LEFT-to-right tokenization drops RIGHT-side tokens - usually
+  losing destination operands or trailing prefix information. Acceptable
+  for most pipelines but note which instructions are affected; downstream
+  tasks that care about those specific patterns (locked atomics, long
+  AVX512-encoded ops, nested SIB+disp+extra-operand) will silently drop
+  information for those cases.
+- **IF >5% of your instruction stream exceeds the cap**: you need either
+  (a) to raise SEQ_LEN and retrain positional embeddings, or (b) to
+  preprocess instructions to collapse them to fewer tokens (merge
+  consecutive addressing tokens into a single compound token).
+- **IF truncated vs extended embeddings match at cosine > 0.99**:
+  truncation is effectively lossless on this input and both SEQ_LEN
+  values can be treated as interchangeable for same-length inputs.
+- **IF cosine(SEQ_LEN=20, SEQ_LEN=32) is ~0.90, NOT ~1.00**: two
+  distinct effects are mixed together:
     1. Real truncation: if the instruction is >18 tokens, the long-seq
        version contains tokens the short-seq version lost.
     2. **Padding dilution in mean-pool**: UsableTransformer mean-pools
@@ -44,22 +53,45 @@ What the result reveals - concrete consequences
        encoded at SEQ_LEN=32 has more padding positions averaged into the
        result than the same instruction at SEQ_LEN=20. Even when no
        truncation happens, the pooled vector drifts.
-  Concrete consequence (even without truncation): if two pipelines in the
-  same org pick different SEQ_LEN values for encoding, their embeddings
+  Consequence: pipelines picking different SEQ_LEN values for encoding
   are NOT cross-comparable. The same instruction encoded at 20 vs 32 will
   land in measurably different places in the 128-dim space. Fix: either
   (a) standardize SEQ_LEN across all consumers, or (b) switch pooling to
   mask-aware mean (average over content positions only) - a ~5-line patch
-  in eval_utils.py. Mask-aware pooling would also make embeddings
-  invariant to padding, improving the reproducibility of the whole
-  pipeline.
-- **Position-embedding validity past index 19**: PalmTree trained position
-  embeddings only up to index 19 (SEQ_LEN=20). Running it at SEQ_LEN=32
-  still produces outputs because the position embedding table is sized
-  past that - but those positions got no training signal. The output is
-  technically well-defined but semantically unvalidated. Treat it as a
-  reference for "how different is no-truncation from truncation" - not as
-  a ground-truth "correct" embedding.
+  in eval_utils.py.
+- **IF cosine(SEQ_LEN=20, SEQ_LEN=32) < 0.8**: strong truncation effect -
+  the instruction probably exceeds the cap and you are losing real
+  content. Either raise SEQ_LEN (and accept unvalidated positions) or
+  pre-tokenize to shorter forms.
+- **Reminder on position-embedding validity past index 19**: PalmTree
+  trained position embeddings only up to index 19 (SEQ_LEN=20). Running
+  it at SEQ_LEN=32 still produces outputs because the position embedding
+  table is sized past that, but those positions got no training signal.
+  Treat the extended-length embedding as a reference for "how different
+  is no-truncation from truncation" - not as a ground-truth "correct"
+  embedding.
+
+Observed results
+----------------
+- **1/19 = 5.3% of the realistic mix gets truncated**: the one casualty
+  is the synthetic `lock cmpxchg [ rdi + rsi * 0x8 + 0x10 + 0x1 + 0x2
+  + 0x3 ] rax rbx` at 19 content tokens. Everything else - even the
+  intentionally-long `vfmadd213ss` variant at 16 tokens and
+  `lock cmpxchg [ rdi + rsi * 0x8 + 0x10 ] rax` at 12 - fits under the
+  cap. Coreutils-like code is safe; locked atomics on deeply-nested SIB
+  expressions are the risk zone.
+- **Truncation direction confirmed right-biased**: on the 21-token
+  synthetic, the first 18 tokens survive
+  (`lock cmpxchg [ rdi + rsi * 0x8 + 0x10 + 0x1 + 0x2 + 0x3 ] rax`)
+  and the tail `rbx rcx rdx` is dropped. Destination operands are the
+  first thing lost - worst case for any task doing write-pattern
+  analysis.
+- **SEQ_LEN=20 vs SEQ_LEN=32 embedding: cosine = +0.9140, L2 distance =
+  8.75**. The drop below 1.0 confirms the combined truncation + padding-
+  dilution bias. Two pipelines picking different SEQ_LEN values will land
+  in measurably different places in the 128-dim space - about 9% off by
+  cosine, which is well beyond typical noise. Cross-pipeline embedding
+  comparison requires pinning SEQ_LEN or switching to mask-aware pooling.
 """
 
 from __future__ import annotations

@@ -21,36 +21,76 @@ data movement, arithmetic, comparison, and control flow. Then:
 No t-SNE/UMAP is drawn (sklearn + matplotlib aren't installed in the pinned
 venv) - instead we report the numbers that those plots would visually convey.
 
-What the result reveals - concrete consequences
--------------------------------------------------
-- **Large positive gap (intra >> inter) + high purity**: PalmTree has learned
-  a genuinely semantic space. Downstream similarity tasks (function cloning,
-  malware family classification) will have strong structural signal to
-  exploit - a linear classifier on top of the embeddings should work out of
-  the box.
-- **Gap near zero or negative purity**: the space is driven mainly by surface
-  token co-occurrence, not semantic category. Practical consequence: any
-  downstream task that assumes "instructions doing similar things have
-  similar embeddings" will need fine-tuning on labeled pairs. Frozen-model
-  transfer will underperform.
-- **data_movement has low/negative intra-gap (observed)**: `mov` variants are
-  genuinely far apart in the space because operand patterns (reg-reg vs
-  memory-load vs memory-store) dominate the embedding. This is a *feature*
-  for operand-aware downstream tasks (stack-frame analysis, call-convention
-  inference) but a *bug* for coarse opcode-family classification. If your
-  downstream task treats all movs as interchangeable, you will want to
-  pre-cluster or aggregate them yourself.
-- **`lea rax [rbx + rcx*4]` classified as arithmetic**: the model has
-  inferred a non-trivial semantic property - that `lea` is an ALU op, not
-  data movement. This is exactly the kind of deduction you want for reverse
-  engineering: the model learned from behavior patterns in Coreutils that
-  `lea` appears near adds/imuls even though its mnemonic says "load".
-- **Purity 60-70%**: typical "good but not great". Downstream classifiers
-  can reach higher accuracy by pooling multiple instructions (reducing
-  per-sample noise) and/or adding explicit opcode features on top of the
-  embedding.
-- **Purity < 30% (near random)**: something is broken in the pipeline or the
-  model file. Re-check the pickle shim and the vocab load.
+What the experiment reveals
+---------------------------
+(Purely hypothetical branches. Each bullet is "IF you see X -> it means Y",
+covering possibilities that may or may not materialize in any given run.
+The actual numbers from this run are in "Observed results" below.)
+
+- **IF all four families show large positive gaps (intra >> inter) AND
+  purity > 80%**: PalmTree has learned a genuinely semantic space.
+  Downstream similarity tasks (function cloning, malware family
+  classification) will have strong structural signal to exploit - a linear
+  classifier on top of the embeddings should work out of the box.
+- **IF overall gap is near zero OR purity is near the 25% random baseline**:
+  the space is driven mainly by surface token co-occurrence, not semantic
+  category. Practical consequence: any downstream task that assumes
+  "instructions doing similar things have similar embeddings" will need
+  fine-tuning on labeled pairs. Frozen-model transfer will underperform.
+- **IF data_movement specifically shows a low or negative intra-gap while
+  other families show positive gaps**: `mov` variants are far apart in the
+  space because operand patterns (reg-reg vs memory-load vs memory-store)
+  dominate the embedding. This is a *feature* for operand-aware downstream
+  tasks (stack-frame analysis, call-convention inference) but a *bug* for
+  coarse opcode-family classification. If your downstream task treats all
+  movs as interchangeable, pre-cluster or aggregate them yourself.
+- **IF instead data_movement shows a high positive gap like the others**:
+  the model treats the `mov` mnemonic as a strong family signal and
+  operand details are subordinate - which means you would LOSE the
+  load-vs-store, arg-setup-vs-local-var distinctions that matter for
+  stack-frame analysis. Useful for mnemonic-family classification, but
+  worse for role-aware tasks.
+- **IF `lea` is classified as arithmetic**: the model has inferred a
+  non-trivial semantic property - that `lea` is an ALU op, not data
+  movement. Exactly the deduction you want for reverse engineering: the
+  model learned from behavior patterns in Coreutils that `lea` appears
+  near adds/imuls even though its mnemonic says "load".
+- **IF instead `lea` lands in data_movement by nearest-neighbor vote**:
+  the model is opcode-biased (mnemonic "lea" -> "looks like a mov"). You
+  would lose a useful deduction for free; add explicit opcode-usage
+  features if downstream tasks depend on ALU-op recognition.
+- **IF purity is 60-70%**: typical "good but not great". Downstream
+  classifiers can reach higher accuracy by pooling multiple instructions
+  (reducing per-sample noise) and/or adding explicit opcode features on
+  top of the embedding.
+- **IF purity < 30% (near random)**: something is broken in the pipeline
+  or the model file. Re-check the pickle shim and the vocab load.
+
+Observed results
+----------------
+- **Intra/inter gaps per family**: arithmetic +0.176, comparison +0.183,
+  control_flow +0.204, data_movement -0.009. Three families show the
+  predicted "tighter inside than across" pattern; data_movement does NOT.
+  The negative gap confirms mov variants are operand-dominated, not
+  opcode-dominated - use this as the canonical example when arguing that
+  PalmTree is an operand-aware, not a mnemonic-only, embedding.
+- **1-NN purity = 14/21 = 66.7% vs 25% random baseline (2.67x lift)**:
+  solid-but-imperfect semantic structure. The 7 misses are diagnostic:
+  `mov rax rbx` -> `add rax rbx` (register copy ~ ALU on same regs),
+  `mov rdi rsp` -> `imul rdx rbx` (function-arg setup classified as
+  arithmetic), `pop rcx` -> `ret` (stack-pop classified as control flow -
+  arguably semantically correct), `add rax rbx` -> `mov rax rbx`
+  (symmetric of the first miss), `cmp rax rbx` and `cmp eax 0x0` -> mov/add
+  (comparison bleeding into arithmetic), and `call symbol` -> `inc rdx`
+  (call misfiled). Actionable: the confusion is mostly arithmetic <-> data
+  movement <-> comparison at the register-reg boundary; control_flow is
+  nearly clean (jmp/je/jne/ret all correct).
+- **Probes**: `lea` -> arithmetic (all three nearest neighbors are
+  arithmetic: add/xor/shr). The model HAS learned lea is an ALU op.
+  `mov [rbp-0x8] rax` -> data_movement (top-3 all data_movement).
+  `xchg rax rbx` -> data_movement with sim 0.865 to `mov rax rbx` -
+  excellent: the model knows xchg is a mov-family operation despite being
+  a rare opcode.
 """
 
 from __future__ import annotations

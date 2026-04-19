@@ -23,44 +23,86 @@ grouped by expected coverage tier:
 For each tier we tokenize every instruction, look up each token in
 vocab.stoi, and count how many map to unk_index (1).
 
-What the result reveals - concrete consequences
--------------------------------------------------
-- **CORE tier ~0% OOV (expected)**: basic userspace x86 is fully covered.
-  Any nonzero CORE OOV means the vocab file is wrong or truncated - stop
-  and re-verify the pickle load.
-- **SIMD/AVX tier 30-60% OOV (observed ~32%)**: every `ymm*` and many
-  `vpXXX` / `vmovXXX` mnemonics are missing. Practical consequence:
-  performance-critical code (crypto, media, ML kernels, modern `memcpy`
-  that goes through AVX) cannot be meaningfully represented. A
-  function-level embedding of an AVX-heavy binary will be dominated by
-  `<unk>` tokens and collapse to an uninformative vector. If your thesis
-  evaluates PalmTree on OpenSSL or a video codec, your numbers will look
-  worse than PalmTree's real capability simply because of vocabulary
+What the experiment reveals
+---------------------------
+(Purely hypothetical branches. Each bullet is "IF you see X -> it means Y",
+covering possibilities that may or may not materialize in any given run.
+The actual numbers from this run are in "Observed results" below.)
+
+- **IF CORE tier is ~0% OOV**: expected - basic userspace x86 is fully
+  covered.
+- **IF CORE tier has any nonzero OOV**: the vocab file is wrong or
+  truncated. Stop and re-verify the pickle load.
+- **IF SIMD/AVX tier lands at 30-60% OOV**: every `ymm*` and many `vpXXX`
+  / `vmovXXX` mnemonics are missing. Practical consequence: performance-
+  critical code (crypto, media, ML kernels, modern `memcpy` via AVX)
+  cannot be meaningfully represented. A function-level embedding of an
+  AVX-heavy binary will be dominated by `<unk>` tokens and collapse to
+  an uninformative vector. Evaluating PalmTree on OpenSSL or a video
+  codec would look worse than its real capability purely due to vocab
   mismatch - not a model-quality issue.
-- **SYSCALL_PRIV tier ~50%+ OOV (observed ~56%)**: kernel code, bootloaders,
-  hypervisors, and anything using privileged instructions is out of scope.
-  Consequence: PalmTree is NOT the right embedding for a kernel-fuzzing or
+- **IF SIMD OOV is near 0%**: the checkpoint has a SIMD-extended vocab
+  (not the shipped PalmTree). Verify the model file before citing
+  numbers from this run.
+- **IF SIMD OOV approaches 100%**: entire vector mnemonic family missing
+  - the vocab was built on a pure scalar-only corpus. Downstream vector
+  analysis is not viable without retraining.
+- **IF SYSCALL_PRIV tier shows ~50%+ OOV**: kernel code, bootloaders,
+  hypervisors, and anything using privileged instructions are out of
+  scope. PalmTree is NOT the right embedding for a kernel-fuzzing or
   syscall-clustering task without vocab extension or retraining.
-- **LIBC_CALLEES ~50% OOV (every function name misses)**: the only token
-  that distinguishes `call memcpy` from `call malloc` is the callee - and
-  it's unk. Consequence (also surfaced in A2): your pipeline must rename
-  libc targets to `symbol` (or richer normalization) BEFORE encoding or
-  you lose all library-call distinction.
-- **RAW_LITERALS ~30% OOV (by design)**: large hex constants collapse to
-  `<unk>` because PalmTree expects a preprocessor (Binary Ninja in the
-  paper) to have already mapped them to `address` / `string`. If you're
-  feeding raw objdump output, you're skipping this step and silently
-  degrading the embedding. The fix is a ~10-line normalization pass that
-  maps constants wider than 6 hex digits (but narrower than 15) to
-  `address` when absent from the symbol table, `symbol` when present.
-- **Top OOV token list (printed at the end)**: tells you concretely WHICH
-  tokens are missing. If a single OOV token dominates (e.g. `ymm0`
-  appearing 5 times), you may be able to plug the gap with a targeted
-  vocab extension rather than a full retrain. If the list is scattered
-  across hundreds of different tokens, retrain or swap models.
-- **Total OOV rate**: one number to report in a thesis chapter when arguing
-  "PalmTree's vocabulary is shaped like Coreutils". A rate >20% on a
-  non-Coreutils corpus is a defensible concrete claim.
+- **IF SYSCALL_PRIV is low OOV**: either the corpus included kernel
+  sources or the vocab has been extended. Double-check provenance.
+- **IF LIBC_CALLEES OOV is ~50% (every function name misses, the `call`
+  opcode itself is in-vocab)**: the only distinguishing token in
+  `call <fn>` is OOV. Your pipeline must rename libc targets to `symbol`
+  (or richer normalization) BEFORE encoding or you lose all library-call
+  distinction. (Also surfaced in A2.)
+- **IF LIBC_CALLEES OOV is low**: the vocab has added libc names -
+  verify it is not a leakage artifact from training data contamination.
+- **IF RAW_LITERALS OOV is ~30% (by design)**: large hex constants
+  collapse to `<unk>` because PalmTree expects a preprocessor to have
+  already mapped them to `address` / `string`. Feeding raw objdump
+  output silently degrades the embedding. Fix: a ~10-line normalization
+  pass mapping constants wider than 6 hex digits (but narrower than 15)
+  to `address` when absent from the symbol table, `symbol` when present.
+- **IF RAW_LITERALS OOV is near 0%**: your corpus had literal coverage
+  (or tiny literals that fit in vocab). Uncommon for arbitrary binaries;
+  do not assume this transfers to a production disassembly stream.
+- **IF a single token dominates the top-OOV list (e.g. `ymm0` appearing
+  many times)**: you may plug the gap with a targeted vocab extension
+  rather than a full retrain.
+- **IF the top-OOV list is scattered across hundreds of different
+  tokens**: no single fix will help; retrain or swap models.
+- **IF total OOV rate > 20% on a non-Coreutils corpus**: defensible
+  thesis claim that PalmTree's vocabulary is shaped like Coreutils and
+  does not generalize.
+- **IF total OOV rate is near 0%**: either you fed Coreutils-like code
+  or you're running a different tokenizer. Audit before citing.
+
+Observed results
+----------------
+- **Vocab size = 6,631 tokens (unk_index=1)**: the number to cite when
+  stating PalmTree's vocabulary scale.
+- **Per-tier OOV rates**:
+    - CORE: 0/36 = 0.0% (baseline sanity: vocab and shim are healthy)
+    - SYSCALL_PRIV: 9/16 = 56.2%
+    - SIMD: 9/28 = 32.1%
+    - STRING_OP: 1/10 = 10.0% (only `lodsq` misses)
+    - LIBC_CALLEES: 9/18 = 50.0% (every function name OOV; the `call`
+      opcode itself is in-vocab)
+    - RAW_LITERALS: 5/16 = 31.2%
+    - TOTAL: 33/124 = 26.6%
+- **Top offenders**: `ymm0` appears 5x - one targeted vocab extension would
+  recover most SIMD entries. `0x401020` appears 2x (raw absolute address
+  literals; belong behind an `address` normalizer). The rest of the OOV
+  list is scattered across kernel/privileged opcodes (`syscall`, `sysret`,
+  `sysenter`, `sysexit`, `wrmsr`, `rdmsr`, `iret`, `lgdt`, `swapgs`),
+  AVX mnemonics (`vpxor`, `vmovdqa`, `vbroadcastsd`, `pshufb`), and each
+  libc function name.
+- **Concrete thesis claim**: "On a non-Coreutils corpus the OOV rate is
+  26.6% overall, with >50% OOV for libc callees and privileged
+  instructions" - defensible from this table alone.
 """
 
 from __future__ import annotations

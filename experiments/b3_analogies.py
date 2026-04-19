@@ -16,8 +16,8 @@ and find the rank of d among a large set of candidate instructions. Lower
 rank = stronger analogy quality.
 
 Analogies tested
-----------------
-A) Opcode substitution (register arg held constant):
+----------------A
+) Opcode substitution (register arg held constant):
      "add rax rbx" - "add rax rcx" + "mov rax rcx"  ~  "mov rax rbx"
 
 B) Register substitution (opcode held constant):
@@ -28,33 +28,69 @@ B) Register substitution (opcode held constant):
 C) Register destination swap:
      "mov rax rbx" - "mov rax rcx" + "mov rdi rcx"  ~  "mov rdi rbx"
 
-What the result reveals - concrete consequences
--------------------------------------------------
-- **Top-1 hits**: PalmTree's embedding space is (approximately) linear in
-  opcode and operand components. Practical consequence: you can do
-  token-level algebra on embeddings to compose queries. Example utility:
-  "show me all registers substituted with rdi" becomes a vector-arithmetic
-  operation, not a string-manipulation-then-re-encode round trip.
-- **Target at rank 2, beaten by the `c` term**: this is the classic
-  word2vec analogy pitfall - the predicted vector sits very close to `c`
-  (its largest constituent), so `c` wins the cosine race even when the
-  analogy is mostly right. Mitigation for downstream consumers: exclude
-  the input terms {a, b, c} from the candidate pool before ranking, or
-  use 3CosMul instead of 3CosAdd for ranking. For a thesis, rank-2 is
-  still evidence of meaningful linear structure.
-- **Weak analogies (target in top-20 or worse)**: embeddings are holistic,
-  not compositional. Consequence for downstream design: aggregating
-  instructions into function embeddings via NAIVE MEAN (sum then divide)
-  will lose signal. You need a learned aggregator (attention pooling,
-  transformer on top of PalmTree embeddings) to recover function-level
-  similarity. This is exactly the gap that later models like jTrans
-  address by end-to-end fine-tuning on function pairs.
-- **Top-5 dominated by the same register/opcode as `c`**: the analogy is
-  "moving along a register axis". If that axis is long (the c term
-  dominates the vector), the analogy mechanism degenerates into "find
-  things similar to c". If the axis is short (a-b is comparable in
-  magnitude to c), you see cleaner analogies. Tuning analogies to work
-  well often requires similar-magnitude operands.
+What the experiment reveals
+---------------------------
+(Purely hypothetical branches. Each bullet is "IF you see X -> it means Y",
+covering possibilities that may or may not materialize in any given run.
+The actual numbers from this run are in "Observed results" below.)
+
+- **IF the expected target hits rank 1 (top-1) across most analogies**:
+  PalmTree's embedding space is approximately linear in opcode and
+  operand components. You can do token-level algebra on embeddings to
+  compose queries. Example utility: "show me all registers substituted
+  with rdi" becomes a vector-arithmetic operation, not a
+  string-manipulation-then-re-encode round trip.
+- **IF the expected target lands at rank 2, beaten by the `c` term**:
+  classic word2vec analogy pitfall - the predicted vector sits very
+  close to `c` (its largest constituent), so `c` wins the cosine race
+  even when the analogy is mostly right. Mitigation: exclude the input
+  terms {a, b, c} from the candidate pool before ranking, or use
+  3CosMul instead of 3CosAdd for ranking. Rank-2 is still evidence of
+  meaningful linear structure.
+- **IF the expected target lands in top-20 or worse**: embeddings are
+  holistic, not compositional. Consequence for downstream design:
+  aggregating instructions into function embeddings via NAIVE MEAN
+  (sum then divide) will lose signal. You need a learned aggregator
+  (attention pooling, transformer on top of PalmTree embeddings) to
+  recover function-level similarity. Exactly the gap that later models
+  like jTrans address by end-to-end fine-tuning on function pairs.
+- **IF top-5 is dominated by instructions sharing the same register or
+  opcode as `c`**: the analogy is "moving along a register axis". When
+  that axis is long (c term dominates the vector), the mechanism
+  degenerates into "find things similar to c". When the axis is short
+  (a-b is comparable in magnitude to c), analogies are cleaner. Tuning
+  analogies often requires similar-magnitude operands.
+- **IF rank varies wildly across the three analogies (e.g. one top-1,
+  one rank 30)**: linearity is partial and directional - some axes
+  (opcode substitution, destination register) are well-learned, others
+  (source register, address mode) are not. A thesis should report the
+  full rank distribution, not a single aggregate number.
+
+Observed results
+----------------
+- **[1] opcode substitution (add -> mov): rank 2/35**. The expected target
+  `mov rax rbx` scored 0.749, beaten by the `c` input term `mov rax rcx`
+  at 0.860. Classic word2vec "c dominates" pitfall: subtract `add rax rcx`
+  from `add rax rbx` leaves a vector close to `mov rax rcx` rather than
+  neatly translated to `mov rax rbx`. Near-miss but the analogy structure
+  is present (all five top-5 candidates share either the mov opcode or
+  the rbx register with the expected answer).
+- **[2] dest register swap (rax -> rdi): rank 2/35**. Expected `mov rdi rbx`
+  at 0.678, beaten by `c` = `mov rdi rcx` at 0.697. Same failure mode as
+  [1]: the c-term dominance. But crucially the top-4 candidates all share
+  the target's rdi destination, so the "swap destination to rdi" axis
+  was correctly extracted.
+- **[3] source register swap (rbx -> rcx): rank 1/35 - TOP-1 HIT**. Expected
+  `add rax rcx` wins at 0.750 (very narrowly over `add rax rbx` at 0.746).
+  When the analogy axis (the a-b vector = `add - mov` opcode delta) is
+  substantial and the c term (`mov rax rcx`) doesn't overlap with the
+  expected target in opcode, the analogy lands cleanly.
+- **Aggregate: 1/3 top-1, 3/3 top-2. Rank distribution = [2, 2, 1]**. This
+  is PARTIAL linearity: enough structure to support interpretability
+  tooling (e.g. "find all variants substituting rdi" via vector arithmetic)
+  if you exclude input terms from the candidate pool, but not enough that
+  raw 3CosAdd is a reliable retrieval method. For function-level tasks
+  you will still want a learned aggregator.
 
 Bottom line for thesis: report the rank distribution across several
 analogies, not a single top-1 hit rate. PalmTree shows PARTIAL linearity

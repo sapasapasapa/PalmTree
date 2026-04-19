@@ -40,39 +40,71 @@ position/segment embedding, before any transformer block). For each layer:
 3. Report the discrimination ratio = mean_intra - mean_inter. Higher is
    better: that layer separates "same" from "different" more strongly.
 
-What the result reveals - concrete consequences
--------------------------------------------------
-- **Layer 11 beats layer 12 on the gap metric**: the paper's advice holds.
-  Actionable fix in the shipped code: change `eval_utils.py:92` from
-  `self.model.forward(...)` to `self.model.encode(...)`. Existing consumers
-  get a free quality bump without retraining. This would be a one-line PR
+What the experiment reveals
+---------------------------
+(Purely hypothetical branches. Each bullet is "IF you see X -> it means Y",
+covering possibilities that may or may not materialize in any given run.
+The actual numbers from this run are in "Observed results" below.)
+
+- **IF layer 11 beats layer 12 on the gap metric**: the paper's advice
+  holds. Actionable fix in the shipped code: change `eval_utils.py:92`
+  from `self.model.forward(...)` to `self.model.encode(...)`. Existing
+  consumers get a free quality bump without retraining. A one-line PR
   upstream that affects every downstream user.
-- **Layer 12 beats layer 11 (observed on this specific test)**: the paper's
-  claim does NOT generalize to raw cosine-discrimination between
-  semantic groups. There are two possible explanations: (a) the paper's
-  "over-specialization" argument is about transfer-learning AUC on
-  downstream tasks (which is NOT what we measure here), or (b) the
-  specific instruction set used in the test biases which layer wins. Either
-  way: do NOT blindly trust "second-to-last layer is better" as a universal
-  claim. For your own downstream task, measure layer choice on a held-out
-  set of task-labeled pairs. This experiment gives you the infrastructure
-  (layer-stopping encode) to do exactly that.
-- **Early layers (0-4) have low discrimination**: expected, since the first
-  couple of blocks mostly propagate the raw embeddings. If, however, an
-  early layer matches layer 11 on a specific task, that opens the door to
-  a SHALLOWER deployed model. You could fine-tune only the first k blocks
-  and discard the rest - useful for embedding millions of instructions on
-  constrained hardware. This is the distillation / pruning signal.
-- **Intra and inter both drop monotonically as layer increases**: the
-  representation becomes MORE spread out as depth grows (each block
-  pushes tokens apart in the 128-dim space). This is characteristic of
-  BERT-style MLM training. One practical implication: any cosine threshold
-  you tune ("accept pairs with cosine > T") MUST be tuned per layer -
-  thresholds do not transfer across depths.
-- **Negative gap at some layer**: that layer actively CONFUSES arithmetic
-  and control-flow in its representation. Almost always a sign of a
-  catastrophic training issue, a bad load, or a metric bug. Worth re-
-  checking the pickle shim and the model file's integrity.
+- **IF layer 12 beats layer 11**: the paper's claim does NOT generalize
+  to raw cosine-discrimination between semantic groups. Two possible
+  explanations: (a) the paper's "over-specialization" argument is about
+  transfer-learning AUC on downstream tasks (NOT what we measure here),
+  or (b) the specific instruction set used here biases which layer wins.
+  Either way: do NOT blindly trust "second-to-last layer is better" as a
+  universal claim. For your own downstream task, measure layer choice on
+  a held-out set of task-labeled pairs. This experiment gives you the
+  infrastructure (layer-stopping encode) to do that.
+- **IF early layers (0-4) have low discrimination**: expected, since the
+  first couple of blocks mostly propagate the raw embeddings.
+- **IF an early layer matches or beats layer 11 on a specific task**:
+  a SHALLOWER deployed model becomes viable. You could fine-tune only
+  the first k blocks and discard the rest - useful for embedding millions
+  of instructions on constrained hardware. This is the distillation /
+  pruning signal.
+- **IF intra and inter BOTH drop monotonically as layer increases**: the
+  representation becomes more spread out with depth (each block pushes
+  tokens apart in the 128-dim space). Characteristic of BERT-style MLM
+  training. One practical implication: any cosine threshold you tune
+  ("accept pairs with cosine > T") MUST be tuned per layer - thresholds
+  do not transfer across depths.
+- **IF intra/inter are non-monotonic (a middle layer is tighter than its
+  neighbors)**: depth alone does not explain representation spread; some
+  blocks specialize for family-contrastive features while others
+  homogenize. Layer choice becomes non-obvious and must be swept per task.
+- **IF any layer shows a negative gap**: that layer actively CONFUSES
+  arithmetic and control-flow in its representation. Almost always a sign
+  of a catastrophic training issue, a bad load, or a metric bug. Re-check
+  the pickle shim and the model file's integrity.
+
+Observed results
+----------------
+- **Best layer = 12, gap = +0.2435**: the shipped `forward()` (final layer)
+  is the strongest discriminator on this arithmetic-vs-control-flow probe.
+  Paper recommendation (layer 11) gap = +0.0768; delta = -0.1667 in favour
+  of the shipped pipeline. So on THIS metric and THIS instruction set, the
+  paper's advice is wrong and the apparent eval_utils.py "bug" is actually
+  helping. Do not mechanically change `forward` to `encode` without
+  measuring your downstream task first.
+- **Monotonic depth progression**: intra drops 0.984 -> 0.479, inter drops
+  0.982 -> 0.236 as layers deepen. Discrimination widens with depth
+  because inter falls faster than intra - the model pushes semantically
+  different instructions apart more aggressively than it pulls similar
+  ones together. Practical implication: a cosine threshold tuned at
+  layer 11 (where inter ~ 0.63) will not transfer to layer 12 (inter ~ 0.24).
+- **Early layers (0-4) are nearly collapsed (gap <= 0.013)**: as expected,
+  the pre-transformer embedding and first few blocks barely differentiate
+  families. No signal that a shallower deployment would suffice on this
+  probe. For a distillation case you'd want to measure a downstream task,
+  not this cosine proxy.
+- **No negative gaps anywhere**: all 13 layers preserve at least weak
+  intra > inter ordering. Nothing catastrophic in the loaded weights - the
+  pickle shim and vocab are intact.
 """
 
 from __future__ import annotations

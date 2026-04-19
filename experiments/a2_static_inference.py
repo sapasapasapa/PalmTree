@@ -23,39 +23,88 @@ Procedure
    PalmTree has learned that different standard-library functions belong
    to different "semantic neighborhoods".
 
-What the result reveals - concrete consequences
--------------------------------------------------
-- **Determinism holds (max abs diff = 0)**: you can safely cache embeddings
-  in a vector database. Re-encoding the same instruction will never drift
-  your similarity scores. If this failed, every downstream similarity
-  search would produce non-reproducible results and any cache would need
-  invalidation on every query.
-- **Operand-variant spread (mov variants at 0.3-0.6 cosine)**: operand
-  tokens carry real semantic weight even when the opcode token is fixed.
-  Practical consequence: pooling strategy MATTERS. Mean-pooling a basic
-  block that contains different mov roles (register copy vs memory store
-  vs local-variable load) will produce a different embedding than
-  mean-pooling movs that all do the same thing. Downstream tasks can
-  leverage this to distinguish "read-heavy" from "write-heavy" blocks.
-- **OOV collapse on libc callees (cosine 1.000 across every `call <fn>`)**:
-  the VOCABULARY COVERAGE problem in action. If your pipeline takes raw
-  disassembly (with `call memcpy`, `call strcpy`, …) and passes it to
-  PalmTree without renaming libc targets to `symbol`, every such
-  instruction becomes `call <unk>` - completely indistinguishable. Your
-  function-level pooling will see no signal from library calls at all.
-  Fix: pre-normalize callees using the symbol table (matches PalmTree's
-  training rule) before encoding.
-- **In-vocab call-variant spread (cosine 0.39-0.80)**: once tokens are in
-  vocab, the operand role (register-indirect vs memory-indirect vs
-  normalization-symbol) shapes the embedding meaningfully. A downstream
-  task can reliably distinguish `call rax` from `call [rbp - 8]` from
-  `call symbol`, which matters for recognizing dispatch tables vs
-  function-pointer-in-local vs static-binding.
-- **If `address-vs-symbol` cosine drops far below 1.0**: PalmTree has
-  learned that "known symbol" and "unknown address" are DIFFERENT concepts,
-  not just synonyms. Your preprocessor's choice of when to emit `symbol`
-  vs `address` therefore affects the embedding - making the preprocessor
-  part of the model's effective interface.
+What the experiment reveals
+---------------------------
+(Purely hypothetical branches. Each bullet is "IF you see X -> it means Y",
+covering possibilities that may or may not materialize in any given run.
+The actual numbers from this run are in "Observed results" below.)
+
+- **IF determinism holds (max abs diff = 0, array_equal=True)**: you can
+  safely cache embeddings in a vector database. Re-encoding the same
+  instruction will never drift your similarity scores.
+- **IF determinism fails (any nonzero diff)**: every downstream similarity
+  search produces non-reproducible results and any cache would need
+  invalidation on every query. Likely culprits: dropout leaking into eval
+  mode, nondeterministic CUDA kernels, or a float-cast-at-runtime bug.
+- **IF mov-variant spread lands at 0.3 - 0.6 cosine (wide but not
+  collapsed)**: operand tokens carry real semantic weight even with the
+  opcode fixed. Pooling strategy MATTERS - mean-pooling a block with
+  different mov roles gives a different embedding from mean-pooling
+  uniform movs. Downstream can leverage this to distinguish "read-heavy"
+  from "write-heavy" blocks.
+- **IF mov-variant spread collapses near 1.0 for all pairs**: the opcode
+  token dominates and operand differences are ignored. Load/store/arg-
+  setup/copy would all be indistinguishable - a major loss for
+  role-aware tasks.
+- **IF libc callees collapse to cosine 1.000 across every `call <fn>`**:
+  the VOCABULARY COVERAGE problem in action - all libc names are OOV and
+  map to `<unk>`. Your function-level pooling sees zero signal from
+  library calls. Fix: pre-normalize callees to `symbol` (matches
+  PalmTree's training rule) before encoding.
+- **IF libc callees show meaningful spread (cosine < 0.9 across pairs)**:
+  the checkpoint has learned named-symbol embeddings - either because
+  its vocab is extended or you're running a different model. Verify
+  vocab size and checkpoint provenance.
+- **IF in-vocab call-variant spread is wide (min cosine < 0.5)**: operand
+  role (register-indirect vs memory-indirect vs normalization-symbol)
+  shapes the embedding meaningfully. A downstream task can reliably
+  distinguish `call rax` from `call [rbp - 8]` from `call symbol` -
+  useful for dispatch-table vs function-pointer-in-local vs static-
+  binding recognition.
+- **IF in-vocab call variants collapse near cosine 1.0**: the model treats
+  the `call` opcode as dominant and ignores operand distinctions. You
+  would lose dispatch-pattern detection entirely.
+- **IF `address`-vs-`symbol` cosine drops far below 1.0**: PalmTree has
+  learned that "known symbol" and "unknown address" are DIFFERENT
+  concepts, not synonyms. Your preprocessor's choice of when to emit
+  `symbol` vs `address` therefore affects the embedding, making the
+  preprocessor part of the model's effective interface.
+- **IF `address`-vs-`symbol` cosine is near 1.0**: the two normalization
+  tokens are interchangeable and your preprocessor's resolution choice
+  does not matter for the embedding - a simpler deployment story but a
+  lost semantic distinction.
+
+Observed results
+----------------
+- **Determinism: max abs diff = 0.00e+00, array_equal=True**: bit-exact
+  reproducibility on CPU. Safe to cache in a vector store; downstream
+  similarity scores are stable across re-encodings.
+- **mov variants spread = 0.311 - 0.615**: operand patterns reshape the
+  embedding substantially even with opcode held fixed. `mov rdi rsp`
+  (arg-setup) is the outlier - it sits at 0.31 - 0.35 to every other mov,
+  because both operands are stack/arg registers rather than a typical
+  dest/source pair. `mov [rbp-8] rax` and `mov rax [rbp-8]` (store vs
+  load to the SAME address) are at 0.615 - noticeably different despite
+  being semantic inverses. Takeaway: don't assume load/store symmetry in
+  a mean-pooled block.
+- **libc callees: min=max=+1.000, spread=0.000** - complete collapse.
+  Every one of malloc/free/memcpy/memset/printf/fprintf/strcmp is OOV and
+  maps to `<unk>`, so every `call <libc_fn>` is the same embedding. Any
+  downstream task that tries to detect specific libc call patterns on raw
+  disassembly will see ZERO signal. Pre-normalize to `symbol` (or extend
+  vocabulary) before encoding.
+- **In-vocab call variants spread = 0.392 - 0.802**: healthy range. The
+  register-indirect group (call rax/rbx/rdx) clusters tightly (0.72-0.80
+  among themselves and ~0.74-0.79 to `call symbol`). Memory-indirect
+  calls (`call [rax]`, `call [rbp-0x8]`) pull away (0.39-0.61 to others).
+  `call address` sits furthest from `call symbol` (0.633) - confirming
+  the model treats "resolved symbol" and "unresolved address" as
+  different concepts, not synonyms.
+- **address-vs-symbol = 0.633 (well below 1.0)**: normalization choice is
+  load-bearing. A preprocessor that emits `symbol` for every call target
+  (ignoring whether the symbol table actually resolved it) produces
+  different embeddings than one that emits `address` for unresolved
+  targets. Treat the preprocessor as part of the model's interface.
 """
 
 from __future__ import annotations

@@ -27,41 +27,98 @@ And for calls:
 
 Report pairwise cosine similarities.
 
-What the result reveals - concrete consequences
--------------------------------------------------
-- **Raw hex vs `address` far apart (cosine < 0.8)**: normalization is a
-  hard prerequisite. A pipeline that forgets to rewrite `0xdeadbeef` to
-  `address` will produce materially different embeddings than one that
-  does. Concrete consequence for a deployment: the preprocessing pipeline
-  is part of the model's de facto interface - disassembler choice, symbol
-  resolution, and constant-rewriting rules ALL affect the output and must
-  be pinned alongside the model file. This makes PalmTree effectively
-  tightly coupled to its Binary Ninja / objdump+postprocess toolchain.
-- **`address` and `symbol` close but distinct (cosine ~0.7)**: PalmTree
-  distinguishes "known function symbol" from "raw unknown address".
-  Consequence: your preprocessor's rule for WHEN to emit `symbol` vs
-  `address` matters. For a target found in the symbol table, emit
+What the experiment reveals
+---------------------------
+(Purely hypothetical branches. Each bullet is "IF you see X -> it means Y",
+covering possibilities that may or may not materialize in any given run.
+The actual numbers from this run are in "Observed results" below.)
+
+- **IF raw hex vs `address` cosine is < 0.8**: normalization is a hard
+  prerequisite. A pipeline that forgets to rewrite `0xdeadbeef` to
+  `address` will produce materially different embeddings from one that
+  does. Consequence: the preprocessing pipeline is part of the model's
+  de facto interface - disassembler choice, symbol resolution, and
+  constant-rewriting rules ALL affect the output and must be pinned
+  alongside the model file. PalmTree becomes tightly coupled to its
+  Binary Ninja / objdump+postprocess toolchain.
+- **IF raw hex vs `address` cosine is near 1.0**: normalization is
+  effectively optional - the model treats raw hex and normalized
+  `address` interchangeably. A simpler deployment story, but it would
+  contradict the training regime, so suspect a vocab or pipeline bug.
+- **IF `address` and `symbol` are close but distinct (cosine ~0.6-0.75)**:
+  PalmTree distinguishes "known function symbol" from "raw unknown
+  address". Your preprocessor's rule for WHEN to emit `symbol` vs
+  `address` matters - for a target found in the symbol table, emit
   `symbol`; for an unresolved address, emit `address`. Mixing them up
   (e.g. using `symbol` for every call target even when the name is
   missing) changes the embedding.
-- **`call memcpy` cosine 1.000 with `call malloc` and `call printf`**: all
-  three libc names are OOV and collapse to `<unk>` - no library-function
-  distinction survives. Consequence: any downstream task that wants
-  "detect all malloc calls" or "find memcpy-heavy functions" CANNOT rely
-  on the shipped embedding alone. Either (a) fine-tune with added
-  vocabulary, or (b) feed PalmTree a pre-normalized stream where libc
-  targets are replaced by `symbol` (losing the specific-function
+- **IF `address` and `symbol` have cosine near 1.0**: the two
+  normalization tokens are interchangeable for the model and your
+  preprocessor's resolution choice does not matter - a lost semantic
+  distinction but a simpler deployment rule.
+- **IF `call memcpy` shows cosine 1.000 with `call malloc` and
+  `call printf`**: all three libc names are OOV and collapse to `<unk>`
+  - no library-function distinction survives. Any downstream task that
+  wants "detect all malloc calls" or "find memcpy-heavy functions"
+  CANNOT rely on the shipped embedding alone. Either (a) fine-tune with
+  added vocabulary, or (b) feed PalmTree a pre-normalized stream where
+  libc targets are replaced by `symbol` (losing specific-function
   distinction but at least not collapsing to unk).
-- **Small constant (0x8) close to `address` rather than to raw 0xdeadbeef**:
-  the model has learned that small constants (un-normalized by PalmTree's
-  rule) are conceptually closer to addresses than to random unk tokens.
-  This is the BERT weights paying off - the model has formed a prior that
-  small hex constants tend to co-occur with memory/pointer contexts.
-- **Call-variant spread wide (min cosine < 0.5)**: you CAN distinguish
-  register-indirect calls from memory-indirect calls from symbol calls,
-  which is useful for dispatch-pattern detection. Narrow spread would
-  mean PalmTree treats most `call` variants as the same thing, requiring
-  extra features to recover dispatch semantics.
+- **IF libc callees have meaningful spread (cosine < 0.95 between
+  different names)**: the checkpoint has an extended vocab that includes
+  libc names. Verify you are running the intended model.
+- **IF small constant (0x8) is closer to `address` than to raw
+  0xdeadbeef**: the model learned that small constants (un-normalized by
+  PalmTree's rule) are conceptually closer to addresses than to random
+  unk tokens. BERT weights paying off - a prior that small hex constants
+  co-occur with memory/pointer contexts.
+- **IF small constant is closer to raw 0xdeadbeef than to `address`**:
+  the model treats "all hex literals are hex" as the dominant feature,
+  and normalization tokens are semantically disjoint. This would weaken
+  the case for strict PalmTree-style preprocessing.
+- **IF call-variant spread is wide (min cosine < 0.5)**: you CAN
+  distinguish register-indirect calls from memory-indirect calls from
+  symbol calls - useful for dispatch-pattern detection.
+- **IF call-variant spread is narrow (min cosine > 0.8)**: PalmTree
+  treats most `call` variants as the same thing, requiring extra
+  features to recover dispatch semantics.
+
+Observed results
+----------------
+- **Memory operand normalization**:
+    - raw-vs-address = +0.750 (under the 0.8 threshold - normalization
+      matters, but not as dramatically as in call targets).
+    - raw-vs-symbol = +0.653 (raw hex is further from `symbol` than from
+      `address`, consistent with "two unk-class hex literals look more
+      like an unresolved address than a named symbol").
+    - address-vs-symbol = +0.715 (close but distinct - the model
+      preserves the "resolved vs unresolved" axis).
+    - small-vs-address = +0.730 (a plain `0x8` offset is nearly as close
+      to `address` as `address` is to `symbol` - BERT prior in action:
+      small hex constants co-occur with memory/pointer contexts).
+    - small-vs-other-small = +0.876 (two small offsets - 0x8 and 0x10 -
+      are the closest pair, as expected).
+    - Notable anomaly: `mov rax [ rbp - 0xdeadbeef ]` and
+      `mov rax [ rbp - 0x12345678 ]` are at cosine +1.000. Both large
+      hex constants are OOV and collapse to `<unk>`, so the two
+      instructions produce bit-identical embeddings. This is the vocab-
+      coverage problem masquerading as "perfect similarity".
+- **Call target normalization**:
+    - address-vs-symbol = +0.633 (concepts distinguished).
+    - symbol-vs-memcpy = +0.931: `symbol` and `<unk>` (memcpy) are
+      close-but-not-identical - the model has some residual structure
+      even with an unknown token in the callee slot.
+    - memcpy-vs-malloc = +1.000 and memcpy-vs-printf = +1.000: total
+      collapse across every OOV libc name, as predicted.
+    - raw-vs-address = +0.659 (normalization effect for call targets,
+      not memory operands).
+    - Full spread on call variants = 0.633 - 1.000.
+- **Deployment implication (concrete)**: the `mov rax [ rbp - 0xdeadbeef ]`
+  vs `mov rax [ rbp - address ]` cosine is 0.750 - forgetting the
+  normalization step changes the embedding by ~25% in cosine terms. That
+  is enough to wreck any nearest-neighbor retrieval that indexed one
+  normalization and queries another. Pin the preprocessor alongside the
+  model.
 
 Bottom line for deployment: PalmTree is normalization-sensitive. Publish
 (or pin) the exact preprocessor alongside any embedding database; a
