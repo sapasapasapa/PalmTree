@@ -1,7 +1,7 @@
 import os
 from config import *
 from torch import nn
-from scipy.ndimage.filters import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d
 from torch.autograd import Variable
 import torch
 import numpy as np

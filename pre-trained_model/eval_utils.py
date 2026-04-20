@@ -58,7 +58,7 @@ class UsableTransformer:
         print("Loading Vocab", vocab_path)
         self.vocab = vocab.WordVocab.load_vocab(vocab_path)
         print("Vocab Size: ", len(self.vocab))
-        self.model = torch.load(model_path)
+        self.model = torch.load(model_path, map_location="cpu", weights_only=False)
         self.model.eval()
         if USE_CUDA:
             self.model.cuda(CUDA_DEVICE)
